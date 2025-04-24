@@ -34,6 +34,7 @@ from seer_attn.qwen_decode_sparse.attn_gate_inf import ATTNGATE_CLASSES
 import copy, math, os
 from einops import rearrange
 from seer_attn.qwen_decode_sparse.attention_forward_sparse import sparse_flash_attention_forward
+from seer_attn.qwen_decode_sparse.attention_forward_dense import flash_attention_forward
 from seer_attn.modules.layernorm import RMSNorm
 from flash_attn.layers.rotary import apply_rotary_emb_func
 from seer_attn.qwen_decode_sparse.cache_utils import KCompressionCache
@@ -140,6 +141,7 @@ class Qwen2SeerAttention(nn.Module):
 
         self.mask_loss_func = torch.nn.KLDivLoss()
         self.use_flash_rope = config.use_flash_rope
+        self.use_seerattn = config.seerattn_sparsity_method != 'none'
 
     def forward(
         self,
@@ -154,6 +156,7 @@ class Qwen2SeerAttention(nn.Module):
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
+        torch.cuda.nvtx.range_push("qkv proj")
         input_shape = hidden_states.shape[:-1]
         q_len = hidden_states.shape[1]
 
@@ -164,7 +167,8 @@ class Qwen2SeerAttention(nn.Module):
         q = rearrange(q, '... (h d) -> ... h d', d=self.head_dim)
         k = rearrange(k, '... (h d) -> ... h d', d=self.head_dim)
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("rope")
         q_nope, k_nope = q, k
 
         cos, sin = position_embeddings
@@ -174,7 +178,8 @@ class Qwen2SeerAttention(nn.Module):
             k = apply_rotary_emb_func(k, cos, sin, False, True, cu_seqlens=None, max_seqlen=q_len)
         else:
             q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=2)
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("append kv cache")
         cache_seqlens = None
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -182,28 +187,32 @@ class Qwen2SeerAttention(nn.Module):
             cache_seqlens = past_key_value.get_seq_length()
             k = rearrange(k, '... (h d) -> ... h d', d=self.head_dim)
             v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
-
-        if self.config.seerattn_use_oracle_sparse:
-            block_sparse_mask = compute_oracle_sparse_mask(
-                q,
-                k,
-                attention_mask,
-                self.config.seerattn_gate_block_size,
-                self.config.seerattn_threshold,
-            )
-        else:
-            max_cache_len = k.shape[1]
-            block_sparse_mask = self.attn_gate(
-                k_nope,
-                self.layer_idx,
-                k_compressed_cache,
-                q_nope,
-                block_attention_mask,
-                max_cache_len,
-                position_embeddings,
-                block_position_embeddings,
-                threshold=self.config.seerattn_threshold,
-            )
+        torch.cuda.nvtx.range_pop()
+        
+        if self.use_seerattn:
+            torch.cuda.nvtx.range_push("attngate")
+            if self.config.seerattn_use_oracle_sparse:
+                block_sparse_mask = compute_oracle_sparse_mask(
+                    q,
+                    k,
+                    attention_mask,
+                    self.config.seerattn_gate_block_size,
+                    self.config.seerattn_threshold,
+                )
+            else:
+                max_cache_len = k.shape[1]
+                block_sparse_mask = self.attn_gate(
+                    k_nope,
+                    self.layer_idx,
+                    k_compressed_cache,
+                    q_nope,
+                    block_attention_mask,
+                    max_cache_len,
+                    position_embeddings,
+                    block_position_embeddings,
+                    threshold=self.config.seerattn_threshold,
+                )
+            torch.cuda.nvtx.range_pop()
 
         activate_and_original_block_count = None
         if self.config.seerattn_output_sparsity and q_len == 1:
@@ -211,23 +220,37 @@ class Qwen2SeerAttention(nn.Module):
             original_block_count = block_attention_mask.sum() * self.config.num_key_value_heads # block_attention_mask in shape batch, 1, seq(block)
             activate_and_original_block_count = (activate_block_count, original_block_count)
             #print(f"activate_and_original_block_count: {activate_and_original_block_count}")
-            
-        attn_output = sparse_flash_attention_forward(
-            q,
-            k,
-            v,
-            attention_mask=attention_mask,
-            query_length=q_len,
-            softmax_scale=self.scaling,
-            cache_seqlens=cache_seqlens,
-            block_mask=block_sparse_mask,
-            block_size=self.config.seerattn_gate_block_size,
-        )
-        
+    
+        torch.cuda.nvtx.range_push("attention fwd")
+        if self.use_seerattn:
+            attn_output = sparse_flash_attention_forward(
+                q,
+                k,
+                v,
+                attention_mask=attention_mask,
+                query_length=q_len,
+                softmax_scale=self.scaling,
+                cache_seqlens=cache_seqlens,
+                block_mask=block_sparse_mask,
+                block_size=self.config.seerattn_gate_block_size,
+            )
+        else:
+            attn_output = flash_attention_forward(
+                q,
+                k,
+                v,
+                attention_mask=attention_mask,
+                query_length=q_len,
+                softmax_scale=self.scaling,
+                cache_seqlens=cache_seqlens,
+            )
 
+        torch.cuda.nvtx.range_pop()
+        
+        torch.cuda.nvtx.range_push("out proj")
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-
+        torch.cuda.nvtx.range_pop()
         return attn_output, activate_and_original_block_count
 
 
@@ -284,13 +307,13 @@ class Qwen2DecoderLayer(nn.Module):
         block_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-
+        torch.cuda.nvtx.range_push("input norm")
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
-
+        torch.cuda.nvtx.range_pop()
         # Self Attention
-
+        torch.cuda.nvtx.range_push("attention")
         hidden_states, activate_and_original_block_count = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -302,16 +325,19 @@ class Qwen2DecoderLayer(nn.Module):
             block_attention_mask=block_attention_mask,
             **kwargs,
         )
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("post_norm")
         if self.fused_norm:
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual, True)
         else:
             hidden_states = residual + hidden_states
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("mlp residual")
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-
+        torch.cuda.nvtx.range_pop()
         outputs = (hidden_states,activate_and_original_block_count) 
         return outputs
 

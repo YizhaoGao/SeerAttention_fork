@@ -226,7 +226,7 @@ class SeerAttnQwen2Config(PretrainedConfig):
         self.seerattn_use_oracle_sparse = seerattn_use_oracle_sparse
         self.seerattn_output_sparsity = seerattn_output_sparsity
         
-        assert self.seerattn_sparsity_method in ['threshold', 'nz_ratio']
+        assert self.seerattn_sparsity_method in ['threshold', 'nz_ratio', 'none']
         assert self.seerattn_gate_hidden_size in [64, 128, 256]
         assert self.seerattn_gate_block_size in [16, 32, 64]
 

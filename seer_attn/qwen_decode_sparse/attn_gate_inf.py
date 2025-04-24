@@ -222,7 +222,8 @@ class AttnGate(nn.Module):
                 k_compressed[:, -1, :, :] = 0.0
             else:
                 k_remainder = None
-            k = k_compressed_cache.update(layer_idx=layer_idx, k_compressed=k_compressed, k_remainder=k_remainder, is_decode=is_decode)
+        
+            k = k_compressed_cache.update(layer_idx=layer_idx, k_compressed=k_compressed, k_remainder=k_remainder, is_decode=is_decode, hidden_dim=k.shape[-1])
             return None
 
 
